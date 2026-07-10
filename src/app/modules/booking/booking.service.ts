@@ -1,0 +1,862 @@
+import { Types } from "mongoose";
+import ApiError from "../../../errors/ApiErrors";
+import stripe from "../../../config/stripe";
+import { generateBookingId } from "../../../helpers/generateYearBasedId";
+import { USER_ROLES } from "../../../enums/user";
+import { Car } from "../car/car.model";
+import { validateAvailabilityStrict } from "../car/car.utils";
+import { TRANSACTION_STATUS } from "../transaction/transaction.interface";
+import { Transaction } from "../transaction/transaction.model";
+import { BOOKING_STATUS } from "./booking.interface";
+import { Booking } from "./booking.model";
+import {
+  calculateFirstTimeBookingAmount,
+  validateAvailabilityStrictForApproval,
+  populateBookingConflictFields,
+} from "./booking.utils";
+import { sendNotifications } from "../../../helpers/notificationsHelper";
+import { NOTIFICATION_TYPE } from "../notification/notification.constant";
+import { User } from "../user/user.model";
+import { ReviewServices } from "../review/review.service";
+
+const createBookingToDB = async (payload: any, userId: string) => {
+  const from = new Date(payload.fromDate);
+  const to = new Date(payload.toDate);
+
+  // Minimum 24 hours (1 day) validation
+  const diffMs = to.getTime() - from.getTime();
+  const diffHours = diffMs / (1000 * 60 * 60);
+
+  if (diffHours < 24) {
+    throw new ApiError(
+      400,
+      "Minimum booking duration must be 24 hours (1 day)",
+    );
+  }
+
+  await validateAvailabilityStrict(
+    payload.carId,
+    payload.fromDate,
+    payload.toDate,
+  );
+
+  payload.userId = userId;
+
+  const bookingId = await generateBookingId();
+  payload.bookingId = bookingId;
+
+  const car = await Car.findById(payload.carId);
+  if (!car) throw new ApiError(404, "Car not found");
+
+  const isSelfBooking = car?.assignedHosts?.toString() === userId;
+
+  const bookingStatus = isSelfBooking
+    ? BOOKING_STATUS.CONFIRMED
+    : BOOKING_STATUS.REQUESTED;
+
+  const calculation = await calculateFirstTimeBookingAmount(
+    new Date(payload.fromDate),
+    new Date(payload.toDate),
+    car,
+  );
+
+  const result = await Booking.create({
+    ...payload,
+    hostId: car.assignedHosts,
+    bookingStatus,
+    rentalPrice: calculation.baseRentalPrice,
+    platformFee: calculation.platformFee,
+    hostCommission: calculation.hostCommission,
+    adminCommission: calculation.adminCommission,
+    totalAmount: calculation.totalAmount,
+    isSelfBooking,
+    requestedAt: new Date(),
+    ...(isSelfBooking && {
+      approvedAt: new Date(),
+      confirmedAt: new Date(),
+      isPaid: true,
+    }),
+  });
+
+  const notificationText = `Booking ${result.bookingId} status is ${result.bookingStatus}`;
+
+  // Collect receivers
+  const receivers = [
+    {
+      receiver: result.userId.toString(),
+      type: NOTIFICATION_TYPE.USER,
+    },
+    {
+      receiver: result.hostId.toString(),
+      type: NOTIFICATION_TYPE.HOST,
+    },
+  ];
+
+  //  Add admin if exists
+  const admin = await User.findOne({ role: USER_ROLES.SUPER_ADMIN }).select(
+    "_id",
+  );
+  if (admin) {
+    receivers.push({
+      receiver: admin._id.toString(),
+      type: NOTIFICATION_TYPE.ADMIN,
+    });
+  }
+
+  //  Deduplicate by receiver
+  const uniqueReceivers = new Map<string, (typeof receivers)[0]>();
+
+  for (const r of receivers) {
+    if (!uniqueReceivers.has(r.receiver)) {
+      uniqueReceivers.set(r.receiver, r);
+    }
+  }
+
+  //  Send notifications
+  await Promise.all(
+    Array.from(uniqueReceivers.values()).map((r) =>
+      sendNotifications({
+        title: "Booking Notification",
+        text: notificationText,
+        receiver: r.receiver,
+        sender: userId,
+        type: r.type,
+        referenceId: result._id.toString(),
+        referenceModel: "Booking",
+      }),
+    ),
+  );
+
+  return result;
+};
+
+const getHostBookingsFromDB = async (hostId: string, query: any) => {
+  if (!Types.ObjectId.isValid(hostId)) {
+    throw new ApiError(400, "Invalid host id");
+  }
+  console.log(hostId, "HOST ID");
+
+  const { status, page = 1, limit = 20 } = query;
+  const skip = (Number(page) - 1) * Number(limit);
+  const now = new Date();
+
+  // Base Filter
+  const match: any = {
+    hostId: new Types.ObjectId(hostId),
+  };
+
+  console.log(status, "STATUS");
+
+  // Status Filter
+  if (status) {
+    const statuses = status
+      .split(",")
+      .map((s: any) => s.trim().toUpperCase())
+      .filter((s: any) =>
+        Object.values(BOOKING_STATUS).includes(s as BOOKING_STATUS),
+      );
+
+    console.log(statuses, "STATUSES");
+
+    if (!statuses.length) {
+      throw new ApiError(400, "Invalid booking status filter");
+    }
+
+    match.bookingStatus = { $in: statuses };
+  }
+
+  // Expiry & Overlapping Logic for REQUESTED and PENDING bookings (Removed hiding logic)
+  const pipeline: any[] = [{ $match: match }];
+
+  // Final Aggregation with Pagination and Populate
+  const [result] = await Booking.aggregate([
+    ...pipeline,
+    { $sort: { createdAt: -1 } },
+    {
+      $facet: {
+        data: [
+          { $skip: skip },
+          { $limit: Number(limit) },
+          {
+            $lookup: {
+              from: "cars",
+              localField: "carId",
+              foreignField: "_id",
+              as: "carId",
+            },
+          },
+          { $unwind: { path: "$carId", preserveNullAndEmptyArrays: true } },
+          {
+            $lookup: {
+              from: "users",
+              localField: "userId",
+              foreignField: "_id",
+              as: "userId",
+            },
+          },
+          { $unwind: { path: "$userId", preserveNullAndEmptyArrays: true } },
+          {
+            $lookup: {
+              from: "users",
+              localField: "hostId",
+              foreignField: "_id",
+              as: "hostId",
+            },
+          },
+          { $unwind: { path: "$hostId", preserveNullAndEmptyArrays: true } },
+        ],
+        total: [{ $count: "count" }],
+      },
+    },
+  ]);
+
+  const data = result.data || [];
+  const total = result.total?.[0]?.count || 0;
+
+  const targetIds = data
+    .map((b: any) => b.userId?._id?.toString())
+    .filter(Boolean);
+  const reviewedSet = await ReviewServices.getBulkReviewStatus(
+    hostId,
+    targetIds,
+  );
+
+  const dataWithReviewStatus = await Promise.all(
+    data.map(async (b: any) => {
+      const bookingWithConflictFields = await populateBookingConflictFields(b);
+      return {
+        ...bookingWithConflictFields,
+        isReviewed: reviewedSet.has(b.userId?._id?.toString()),
+      };
+    }),
+  );
+
+  return {
+    meta: {
+      page: Number(page),
+      limit: Number(limit),
+      total,
+      totalPage: Math.ceil(total / Number(limit)),
+    },
+    data: dataWithReviewStatus,
+  };
+};
+
+const getUserBookingsFromDB = async (userId: string, query: any) => {
+  if (!Types.ObjectId.isValid(userId)) {
+    throw new ApiError(400, "Invalid user id");
+  }
+
+  const { status, page = 1, limit = 20 } = query;
+
+  const filter: any = {
+    userId: new Types.ObjectId(userId),
+  };
+
+  // ---------- Status Filter ----------
+  if (status) {
+    const statuses = status
+      .split(",")
+      .map((s: string) => s.trim().toUpperCase())
+      .filter((s: string) =>
+        Object.values(BOOKING_STATUS).includes(s as BOOKING_STATUS),
+      );
+
+    if (!statuses.length) {
+      throw new ApiError(400, "Invalid booking status filter");
+    }
+
+    filter.bookingStatus = { $in: statuses };
+  }
+
+  const skip = (Number(page) - 1) * Number(limit);
+
+  const [data, total] = await Promise.all([
+    Booking.find(filter)
+      .sort({ createdAt: -1 })
+      .skip(skip)
+      .limit(Number(limit))
+      .populate("carId")
+      .populate("hostId")
+      .lean(),
+
+    Booking.countDocuments(filter),
+  ]);
+
+  const targetIds = data
+    .map((b: any) => b.hostId?._id?.toString())
+    .filter(Boolean);
+  const reviewedSet = await ReviewServices.getBulkReviewStatus(
+    userId,
+    targetIds,
+  );
+
+  const dataWithReviewStatus = await Promise.all(
+    data.map(async (b: any) => {
+      const bookingWithConflictFields = await populateBookingConflictFields(b);
+
+      return {
+        ...bookingWithConflictFields,
+        isReviewed: reviewedSet.has(b.hostId?._id?.toString()),
+      };
+    }),
+  );
+
+  return {
+    meta: {
+      page: Number(page),
+      limit: Number(limit),
+      total,
+      totalPage: Math.ceil(total / Number(limit)),
+    },
+    data: dataWithReviewStatus,
+  };
+};
+
+const getHostBookingByIdFromDB = async (bookingId: string, hostId: string) => {
+  if (!Types.ObjectId.isValid(bookingId)) {
+    throw new ApiError(400, "Invalid booking id");
+  }
+
+  if (!Types.ObjectId.isValid(hostId)) {
+    throw new ApiError(400, "Invalid host id");
+  }
+
+  const now = new Date();
+
+  const booking = await Booking.findOne({
+    _id: new Types.ObjectId(bookingId),
+    hostId: new Types.ObjectId(hostId),
+  })
+    .populate("carId")
+    .populate("userId")
+    .populate("hostId")
+    .lean();
+
+  if (!booking) {
+    throw new ApiError(404, "Booking not found");
+  }
+
+  console.log(booking, "Booking");
+
+  const isReviewed = await ReviewServices.checkIfAlreadyReviewed(
+    hostId,
+    (booking.userId as any)._id.toString(),
+  );
+
+  const bookingWithConflictFields =
+    await populateBookingConflictFields(booking);
+
+  return {
+    ...bookingWithConflictFields,
+    isReviewed,
+  };
+};
+
+const getUserBookingByIdFromDB = async (bookingId: string, userId: string) => {
+  if (!Types.ObjectId.isValid(bookingId)) {
+    throw new ApiError(400, "Invalid booking id");
+  }
+
+  if (!Types.ObjectId.isValid(userId)) {
+    throw new ApiError(400, "Invalid user id");
+  }
+
+  const booking = await Booking.findOne({
+    _id: new Types.ObjectId(bookingId),
+    userId: new Types.ObjectId(userId),
+  })
+    .populate("carId")
+    .populate("hostId")
+    .lean();
+
+  if (!booking) {
+    throw new ApiError(404, "Booking not found");
+  }
+
+  const isReviewed = await ReviewServices.checkIfAlreadyReviewed(
+    userId,
+    (booking.hostId as any)._id.toString(),
+  );
+
+  const bookingWithConflictFields =
+    await populateBookingConflictFields(booking);
+
+  return {
+    ...bookingWithConflictFields,
+    isReviewed,
+  };
+};
+
+const approveBookingByHostFromDB = async (
+  bookingId: string,
+  hostId: string,
+) => {
+  const booking = await Booking.findById(bookingId);
+
+  if (!booking) throw new ApiError(404, "Booking not found");
+
+  if (!booking.hostId.equals(hostId)) {
+    throw new ApiError(403, "Unauthorized");
+  }
+
+  if (booking.bookingStatus !== BOOKING_STATUS.REQUESTED) {
+    throw new ApiError(400, "Invalid booking state");
+  }
+
+  const now = new Date();
+
+  if (new Date(booking.fromDate) < now) {
+    throw new ApiError(400, "Booking request has expired");
+  }
+
+  // Check overlapping confirmed/ongoing bookings for the user
+  const overlapping = await Booking.findOne({
+    userId: booking.userId,
+    _id: { $ne: booking._id },
+    bookingStatus: {
+      $in: [BOOKING_STATUS.CONFIRMED, BOOKING_STATUS.ONGOING],
+    },
+    fromDate: { $lt: booking.toDate },
+    toDate: { $gt: booking.fromDate },
+  });
+
+  if (overlapping) {
+    throw new ApiError(
+      400,
+      "User already has a confirmed or ongoing booking for this time slot",
+    );
+  }
+
+  /**
+   * STRICT re-validation before approve
+   * Ignore current booking itself
+   */
+  await validateAvailabilityStrictForApproval(
+    booking.carId.toString(),
+    booking.fromDate,
+    booking.toDate,
+    booking._id.toString(),
+  );
+
+  booking.bookingStatus = BOOKING_STATUS.PENDING;
+  booking.approvedAt = new Date();
+  await booking.save();
+
+  //  Send notification to the user, host, and admin
+  await sendNotifications({
+    title: "Booking Approved",
+    text: `Booking ${booking.bookingId} status is ${booking.bookingStatus}`,
+    receiver: booking.userId.toString(),
+    sender: hostId,
+    type: NOTIFICATION_TYPE.USER,
+    referenceId: booking._id.toString(),
+    referenceModel: "Booking",
+  });
+
+  await sendNotifications({
+    title: "Booking Approved",
+    text: `Booking ${booking.bookingId} status is ${booking.bookingStatus}`,
+    receiver: booking.hostId.toString(),
+    sender: hostId,
+    type: NOTIFICATION_TYPE.HOST,
+    referenceId: booking._id.toString(),
+    referenceModel: "Booking",
+  });
+
+  const admin = await User.findOne({ role: USER_ROLES.SUPER_ADMIN }).select(
+    "_id",
+  );
+  if (admin) {
+    await sendNotifications({
+      title: "Booking Approved",
+      text: `Booking ${booking.bookingId} status is ${booking.bookingStatus}`,
+      receiver: admin._id.toString(),
+      sender: hostId,
+      type: NOTIFICATION_TYPE.ADMIN,
+      referenceId: booking._id.toString(),
+      referenceModel: "Booking",
+    });
+  }
+
+  return booking;
+};
+
+const cancelBookingFromDB = async (
+  bookingId: string,
+  actorId: string,
+  actorRole: USER_ROLES,
+) => {
+  // Validate Booking ID
+  if (!Types.ObjectId.isValid(bookingId)) {
+    throw new ApiError(400, "Invalid booking id");
+  }
+
+  // Fetch booking with related info
+  const booking = await Booking.findById(bookingId)
+    .populate("carId")
+    .populate("transactionId");
+
+  if (!booking) throw new ApiError(404, "Booking not found");
+
+  if (booking.bookingStatus === BOOKING_STATUS.CANCELLED) {
+    throw new ApiError(400, "Booking already cancelled");
+  }
+
+  if (booking.bookingStatus === BOOKING_STATUS.COMPLETED) {
+    throw new ApiError(400, "Completed booking cannot be cancelled");
+  }
+
+  //  Role-based permission
+  const isUserActor = actorRole === USER_ROLES.USER;
+  const isHostActor = actorRole === USER_ROLES.HOST;
+  const isAdminActor =
+    actorRole === USER_ROLES.ADMIN || actorRole === USER_ROLES.SUPER_ADMIN;
+
+  if (isUserActor && !booking.userId.equals(actorId)) {
+    throw new ApiError(403, "You are not allowed to cancel this booking");
+  } else if (isHostActor && !booking.hostId.equals(actorId)) {
+    throw new ApiError(403, "Hosts can cancel only their own bookings");
+  } else if (!isUserActor && !isHostActor && !isAdminActor) {
+    throw new ApiError(403, "You are not allowed to cancel this booking");
+  }
+
+  const now = new Date();
+  const transaction = booking.transactionId
+    ? await Transaction.findById(booking.transactionId)
+    : null;
+
+  //  Refund logic (same for all actors)
+  if (transaction && transaction.status === TRANSACTION_STATUS.SUCCESS) {
+    const car = booking.carId as any;
+    if (!car) throw new ApiError(400, "Car details not found");
+
+    const fromDate = new Date(booking.fromDate);
+    const toDate = new Date(booking.toDate);
+    const totalDays =
+      Math.ceil(
+        (toDate.getTime() - fromDate.getTime()) / (1000 * 60 * 60 * 24),
+      ) || 1;
+
+    const paidAmount = transaction.amount;
+    const rentalPrice = (booking as any).rentalPrice;
+    const platformFee = (booking as any).platformFee;
+    const totalRental = rentalPrice + platformFee;
+
+    const diffMs = fromDate.getTime() - now.getTime();
+    const diffHours = diffMs / (1000 * 60 * 60);
+
+    let chargeAmount = 0;
+
+    // Cancellation after pickup → prorated
+    if (now >= fromDate) {
+      const daysUsed = Math.min(
+        Math.ceil((now.getTime() - fromDate.getTime()) / (1000 * 60 * 60 * 24)),
+        totalDays,
+      );
+      chargeAmount = (daysUsed / totalDays) * totalRental;
+    }
+    // Cancellation < 72 hours before pickup → 1 day charge
+    else if (diffHours < 72) {
+      chargeAmount = totalRental / totalDays;
+    }
+
+    // Sanity check
+    chargeAmount = Math.max(0, Math.min(chargeAmount, totalRental));
+    const refundAmount = paidAmount - chargeAmount;
+
+    if (refundAmount > 0 && transaction.stripePaymentIntentId) {
+      await stripe.refunds.create({
+        payment_intent: transaction.stripePaymentIntentId as string,
+        amount: Math.round(refundAmount * 100),
+      });
+      transaction.status = TRANSACTION_STATUS.REFUNDED;
+      await transaction.save();
+
+      // Notification: User
+      await sendNotifications({
+        title: "Refund Processed",
+        text: `Refund of ${refundAmount} processed for booking ${booking.bookingId}`,
+        receiver: booking.userId.toString(),
+        sender: actorId,
+        type: NOTIFICATION_TYPE.USER,
+        referenceId: booking._id.toString(),
+        referenceModel: "Booking",
+      });
+
+      // Notification: Admin
+      const admin = await User.findOne({ role: USER_ROLES.SUPER_ADMIN }).select(
+        "_id",
+      );
+      if (admin) {
+        await sendNotifications({
+          title: "Refund Processed",
+          text: `Refund of ${refundAmount} processed for booking ${booking.bookingId}`,
+          receiver: admin._id.toString(),
+          sender: actorId,
+          type: NOTIFICATION_TYPE.ADMIN,
+          referenceId: booking._id.toString(),
+          referenceModel: "Booking",
+        });
+      }
+    }
+  }
+
+  //  Mark actor who cancelled
+  if (isUserActor) booking.isCanceledByUser = true;
+  if (isHostActor) booking.isCanceledByHost = true;
+  if (isAdminActor) booking.isCanceledByAdmin = true;
+
+  //  Update booking status
+  booking.bookingStatus = BOOKING_STATUS.CANCELLED;
+  booking.isPaid = false;
+  booking.cancelledAt = new Date();
+  await booking.save();
+
+  // Update vehicle availability
+  if (booking.carId) {
+    await Car.findByIdAndUpdate(booking.carId._id, { isAvailable: true });
+  }
+
+  //  Send status notifications
+  await sendNotifications({
+    title: "Booking Cancelled",
+    text: `Booking ${booking.bookingId} status is ${booking.bookingStatus}`,
+    receiver: booking.userId.toString(),
+    sender: actorId,
+    type: NOTIFICATION_TYPE.USER,
+    referenceId: booking._id.toString(),
+    referenceModel: "Booking",
+  });
+
+  await sendNotifications({
+    title: "Booking Cancelled",
+    text: `Booking ${booking.bookingId} status is ${booking.bookingStatus}`,
+    receiver: booking.hostId.toString(),
+    sender: actorId,
+    type: NOTIFICATION_TYPE.HOST,
+    referenceId: booking._id.toString(),
+    referenceModel: "Booking",
+  });
+
+  const admin = await User.findOne({ role: USER_ROLES.SUPER_ADMIN }).select(
+    "_id",
+  );
+  if (admin) {
+    await sendNotifications({
+      title: "Booking Cancelled",
+      text: `Booking ${booking.bookingId} status is ${booking.bookingStatus}`,
+      receiver: admin._id.toString(),
+      sender: actorId,
+      type: NOTIFICATION_TYPE.ADMIN,
+      referenceId: booking._id.toString(),
+      referenceModel: "Booking",
+    });
+  }
+
+  return booking;
+};
+
+const getAllBookingsFromDB = async (query: any) => {
+  const searchTerm = (query.search || query.searchTerm || "").toString().trim();
+  const page = parseInt(query.page || "1", 10);
+  const limit = parseInt(query.limit || "10", 10);
+  const skip = (page - 1) * limit;
+
+  const aggregationPipeline: any[] = [
+    // Lookup car
+    {
+      $lookup: {
+        from: "cars",
+        localField: "carId",
+        foreignField: "_id",
+        as: "car",
+      },
+    },
+    { $unwind: { path: "$car", preserveNullAndEmptyArrays: true } },
+
+    // Lookup host
+    {
+      $lookup: {
+        from: "users",
+        localField: "hostId",
+        foreignField: "_id",
+        as: "host",
+      },
+    },
+    { $unwind: { path: "$host", preserveNullAndEmptyArrays: true } },
+
+    // Lookup user
+    {
+      $lookup: {
+        from: "users",
+        localField: "userId",
+        foreignField: "_id",
+        as: "user",
+      },
+    },
+    { $unwind: { path: "$user", preserveNullAndEmptyArrays: true } },
+  ];
+
+  // Search filter
+  if (searchTerm) {
+    aggregationPipeline.push({
+      $match: {
+        $or: [
+          { bookingId: { $regex: searchTerm, $options: "i" } },
+          { "car.model": { $regex: searchTerm, $options: "i" } },
+          { "car.vehicleId": { $regex: searchTerm, $options: "i" } },
+          { "car.brand": { $regex: searchTerm, $options: "i" } },
+          { "host.name": { $regex: searchTerm, $options: "i" } },
+          { "host.email": { $regex: searchTerm, $options: "i" } },
+          { "user.name": { $regex: searchTerm, $options: "i" } },
+          { "user.email": { $regex: searchTerm, $options: "i" } },
+        ],
+      },
+    });
+  }
+
+  // Booking status filter (Check both status and bookingStatus)
+  const bookingStatus = query.status || query.bookingStatus;
+  if (
+    bookingStatus &&
+    Object.values(BOOKING_STATUS).includes(bookingStatus.toUpperCase())
+  ) {
+    aggregationPipeline.push({
+      $match: {
+        bookingStatus: bookingStatus.toUpperCase(),
+      },
+    });
+  }
+
+  // Count total before pagination
+  const totalMeta = await Booking.aggregate([
+    ...aggregationPipeline,
+    { $count: "total" },
+  ]);
+  const total = totalMeta[0]?.total || 0;
+
+  // Apply sort if provided
+  if (query.sortBy && query.sortOrder) {
+    const sortOrder = query.sortOrder.toLowerCase() === "desc" ? -1 : 1;
+    aggregationPipeline.push({ $sort: { [query.sortBy]: sortOrder } });
+  } else {
+    aggregationPipeline.push({ $sort: { createdAt: -1 } });
+  }
+
+  // Pagination
+  aggregationPipeline.push({ $skip: skip }, { $limit: limit });
+
+  const bookings = await Booking.aggregate(aggregationPipeline);
+
+  const bookingsWithConflictFields = await Promise.all(
+    bookings.map(async (b: any) => {
+      return await populateBookingConflictFields(b);
+    }),
+  );
+
+  return {
+    meta: {
+      total,
+      page,
+      limit,
+      totalPage: Math.ceil(total / limit),
+    },
+    bookings: bookingsWithConflictFields,
+  };
+};
+
+const getSingleBookingByIdFromDB = async (id: string) => {
+  const aggregationPipeline: any[] = [
+    {
+      $match: { _id: new Types.ObjectId(id) },
+    },
+
+    // Lookup car
+    {
+      $lookup: {
+        from: "cars",
+        localField: "carId",
+        foreignField: "_id",
+        as: "car",
+      },
+    },
+    { $unwind: { path: "$car", preserveNullAndEmptyArrays: true } },
+
+    // Lookup host
+    {
+      $lookup: {
+        from: "users",
+        localField: "hostId",
+        foreignField: "_id",
+        as: "host",
+      },
+    },
+    { $unwind: { path: "$host", preserveNullAndEmptyArrays: true } },
+
+    // Lookup user
+    {
+      $lookup: {
+        from: "users",
+        localField: "userId",
+        foreignField: "_id",
+        as: "user",
+      },
+    },
+    { $unwind: { path: "$user", preserveNullAndEmptyArrays: true } },
+
+    { $limit: 1 },
+  ];
+
+  const result = await Booking.aggregate(aggregationPipeline);
+
+  if (!result.length) {
+    throw new ApiError(404, "Booking not found");
+  }
+
+  const booking = await populateBookingConflictFields(result[0]);
+
+  return booking;
+};
+
+const getSelfBookingsByHost = async (
+  hostId: string,
+  status?: BOOKING_STATUS,
+) => {
+  if (!hostId || !Types.ObjectId.isValid(hostId)) {
+    throw new ApiError(400, "Invalid hostId");
+  }
+
+  const filter: any = {
+    hostId: new Types.ObjectId(hostId),
+    isSelfBooking: true,
+  };
+
+  if (status) filter.bookingStatus = status;
+
+  const bookings = await Booking.find(filter)
+    .populate("carId")
+    .sort({ fromDate: -1 }) // latest first
+    .lean();
+
+  const bookingsWithConflictFields = await Promise.all(
+    bookings.map(async (b: any) => {
+      return await populateBookingConflictFields(b);
+    }),
+  );
+
+  return bookingsWithConflictFields;
+};
+
+export const BookingServices = {
+  createBookingToDB,
+  getHostBookingsFromDB,
+  getUserBookingsFromDB,
+  getHostBookingByIdFromDB,
+  getUserBookingByIdFromDB,
+  approveBookingByHostFromDB,
+  cancelBookingFromDB,
+  getSingleBookingByIdFromDB,
+  getAllBookingsFromDB,
+  getSelfBookingsByHost,
+};

@@ -1,0 +1,97 @@
+import express from "express";
+import { BookingControllers } from "./booking.controller";
+import auth from "../../middlewares/auth";
+import { USER_ROLES } from "../../../enums/user";
+import fileUploadHandler from "../../middlewares/fileUploaderHandler";
+import parseAllFilesData from "../../middlewares/parseAllFileData";
+
+const router = express.Router();
+
+router
+  .route("/")
+  .post(
+    auth(
+      USER_ROLES.USER,
+      USER_ROLES.HOST,
+      USER_ROLES.ADMIN,
+      USER_ROLES.SUPER_ADMIN,
+    ),
+    fileUploadHandler(),
+    parseAllFilesData(
+      { fieldName: "nidFrontPic", forceSingle: true },
+      { fieldName: "nidBackPic", forceSingle: true },
+      { fieldName: "drivingLicenseFrontPic", forceSingle: true },
+      { fieldName: "drivingLicenseBackPic", forceSingle: true },
+    ),
+    BookingControllers.createBookingToDB,
+  );
+
+router
+  .route("/host")
+  .get(
+    auth(USER_ROLES.HOST, USER_ROLES.ADMIN, USER_ROLES.SUPER_ADMIN),
+    BookingControllers.getHostBookings,
+  );
+
+router
+  .route("/host/self")
+  .get(
+    auth(USER_ROLES.HOST, USER_ROLES.ADMIN, USER_ROLES.SUPER_ADMIN),
+    BookingControllers.getSelfBookingsByHost,
+  );
+
+router
+  .route("/host/:bookingId")
+  .get(
+    auth(USER_ROLES.HOST, USER_ROLES.ADMIN, USER_ROLES.SUPER_ADMIN),
+    BookingControllers.getHostBookingById,
+  )
+  .patch(
+    auth(USER_ROLES.HOST, USER_ROLES.ADMIN, USER_ROLES.SUPER_ADMIN),
+    BookingControllers.approveBookingByHost,
+  );
+
+router
+  .route("/cancel/:bookingId")
+  .post(
+    auth(
+      USER_ROLES.USER,
+      USER_ROLES.HOST,
+      USER_ROLES.ADMIN,
+      USER_ROLES.SUPER_ADMIN,
+    ),
+    BookingControllers.cancelBooking,
+  );
+
+router
+  .route("/all")
+  .get(
+    auth(USER_ROLES.ADMIN, USER_ROLES.SUPER_ADMIN),
+    BookingControllers.getAllBookings,
+  );
+
+router
+  .route("/single/:bookingId")
+  .get(
+    auth(USER_ROLES.ADMIN, USER_ROLES.SUPER_ADMIN),
+    BookingControllers.getSingleBookingById,
+  );
+
+router
+  .route("/user")
+  .get(
+    auth(USER_ROLES.USER, USER_ROLES.ADMIN, USER_ROLES.SUPER_ADMIN),
+    BookingControllers.getUserBookings,
+  );
+
+router
+  .route("/user/:bookingId")
+  .get(
+    auth(USER_ROLES.USER, USER_ROLES.ADMIN, USER_ROLES.SUPER_ADMIN),
+    BookingControllers.getUserBookingById,
+  );
+
+router.get("/success", BookingControllers.paymentSuccess);
+router.get("/fail", BookingControllers.paymentFail);
+
+export const BookingRoutes = router;

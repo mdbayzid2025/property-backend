@@ -1,0 +1,168 @@
+import catchAsync from "../../../shared/catchAsync";
+import sendResponse from "../../../shared/sendResponse";
+import { BOOKING_STATUS } from "./booking.interface";
+import { BookingServices } from "./booking.service";
+
+const createBookingToDB = catchAsync(async (req, res) => {
+  const payload = req.body;
+  const { id: userId } = req.user as { id: string };
+  const result = await BookingServices.createBookingToDB(payload, userId);
+  sendResponse(res, {
+    statusCode: 200,
+    success: true,
+    message: "Booking created successfully",
+    data: result,
+  });
+});
+
+const getHostBookings = catchAsync(async (req, res) => {
+  const { id: userId } = req.user as { id: string };
+
+  const result = await BookingServices.getHostBookingsFromDB(userId, req.query);
+
+  sendResponse(res, {
+    statusCode: 200,
+    success: true,
+    message: "Host bookings fetched successfully",
+    data: result,
+  });
+});
+
+const getHostBookingById = catchAsync(async (req, res) => {
+  const { id: hostId } = req.user as { id: string };
+  const { bookingId } = req.params;
+
+  const result = await BookingServices.getHostBookingByIdFromDB(
+    bookingId,
+    hostId,
+  );
+
+  sendResponse(res, {
+    statusCode: 200,
+    success: true,
+    message: "Host booking fetched successfully by id",
+    data: result,
+  });
+});
+
+const getUserBookings = catchAsync(async (req, res) => {
+  const { id: userId } = req.user as { id: string };
+
+  const result = await BookingServices.getUserBookingsFromDB(userId, req.query);
+  sendResponse(res, {
+    statusCode: 200,
+    success: true,
+    message: "User bookings fetched successfully",
+    data: result,
+  });
+});
+
+const getUserBookingById = catchAsync(async (req, res) => {
+  const { id: userId } = req.user as { id: string };
+  const { bookingId } = req.params;
+
+  const result = await BookingServices.getUserBookingByIdFromDB(
+    bookingId,
+    userId,
+  );
+
+  sendResponse(res, {
+    statusCode: 200,
+    success: true,
+    message: "User booking fetched successfully by id",
+    data: result,
+  });
+});
+
+const approveBookingByHost = catchAsync(async (req, res) => {
+  const { id: hostId } = req.user as { id: string };
+  const { bookingId } = req.params;
+  console.log(bookingId, "BookingId");
+  const result = await BookingServices.approveBookingByHostFromDB(
+    bookingId,
+    hostId,
+  );
+  sendResponse(res, {
+    statusCode: 200,
+    success: true,
+    message: "Booking approved successfully",
+    data: result,
+  });
+});
+
+const cancelBooking = catchAsync(async (req, res) => {
+  const { id: actorId, role } = req.user as { id: string; role: any };
+  const { bookingId } = req.params;
+
+  const result = await BookingServices.cancelBookingFromDB(
+    bookingId,
+    actorId,
+    role,
+  );
+
+  sendResponse(res, {
+    statusCode: 200,
+    success: true,
+    message: "Booking cancelled successfully",
+    data: result,
+  });
+});
+
+const getAllBookings = catchAsync(async (req, res) => {
+  const result = await BookingServices.getAllBookingsFromDB(req.query);
+  sendResponse(res, {
+    statusCode: 200,
+    success: true,
+    message: "All bookings fetched successfully",
+    data: result.bookings,
+    meta: result.meta,
+  });
+});
+
+const getSingleBookingById = catchAsync(async (req, res) => {
+  const { bookingId } = req.params;
+  const result = await BookingServices.getSingleBookingByIdFromDB(bookingId);
+  sendResponse(res, {
+    statusCode: 200,
+    success: true,
+    message: "Booking fetched successfully by id",
+    data: result,
+  });
+});
+
+const getSelfBookingsByHost = catchAsync(async (req, res) => {
+  const { id: hostId } = req.user as { id: string };
+  const { status } = req.query as { status?: BOOKING_STATUS };
+  const result = await BookingServices.getSelfBookingsByHost(hostId, status);
+  sendResponse(res, {
+    statusCode: 200,
+    success: true,
+    message: "Self bookings fetched successfully",
+    data: result,
+  });
+});
+
+const paymentSuccess = catchAsync(async (req, res) => {
+  // Render success page or redirect to frontend success page
+  res.render("success");
+});
+
+const paymentFail = catchAsync(async (req, res) => {
+  // Render cancel page or redirect to frontend cancel page
+  res.render("fail");
+});
+
+export const BookingControllers = {
+  createBookingToDB,
+  getHostBookings,
+  getHostBookingById,
+  getUserBookings,
+  getUserBookingById,
+  approveBookingByHost,
+  cancelBooking,
+  getSingleBookingById,
+  getAllBookings,
+  getSelfBookingsByHost,
+  paymentSuccess,
+  paymentFail,
+};

@@ -1,0 +1,357 @@
+import ApiError from "../../../errors/ApiErrors";
+import { AVAILABLE_DAYS } from "../car/car.interface";
+import { Car } from "../car/car.model";
+import { generateRequestedHours, getLocalDetails } from "../car/car.utils";
+import { BOOKING_STATUS } from "./booking.interface";
+import { Booking } from "./booking.model";
+import { Charges } from "../charges/charges.model";
+
+export const calculateFirstTimeBookingAmount = async (
+  from: Date,
+  to: Date,
+  car: any,
+) => {
+  const totalMs = to.getTime() - from.getTime();
+
+  const totalHours = Math.ceil(totalMs / (1000 * 60 * 60)); // round up partial hour
+  const dailyHours = 24;
+
+  // Minimum 1 day
+  const effectiveHours = totalHours < dailyHours ? dailyHours : totalHours;
+
+  const fullDays = Math.floor(effectiveHours / dailyHours);
+  let remainingHours = effectiveHours % dailyHours;
+
+  let baseRentalPrice = fullDays * car.dailyPrice;
+
+  // If remaining hours > 12, count it as 1 full day
+  if (remainingHours > 0) {
+    if (remainingHours > 12) {
+      baseRentalPrice += car.dailyPrice;
+    } else {
+      baseRentalPrice += (car.dailyPrice / dailyHours) * remainingHours;
+    }
+  }
+
+  // Get charges configuration
+  const charges = await Charges.findOne();
+  if (!charges) {
+    throw new ApiError(404, "Charges configuration not found");
+  }
+
+  const normalize = (percent: number) =>
+    percent > 1 ? percent / 100 : percent;
+
+  const platformPercent = normalize(charges.platformFee);
+  const hostPercent = normalize(charges.hostCommission);
+  const adminPercent = normalize(charges.adminCommission);
+
+  // Calculate fees based on rental price
+  const platformFee = +(baseRentalPrice * platformPercent).toFixed(2);
+  const hostCommission = +(baseRentalPrice * hostPercent).toFixed(2);
+  const adminCommission = +(
+    baseRentalPrice -
+    platformFee -
+    hostCommission
+  ).toFixed(2);
+
+  // Total amount = Rental Price + Platform Fee + Deposit
+  const totalAmount = baseRentalPrice + platformFee + (car.depositAmount || 0);
+
+  return {
+    totalAmount: Number(totalAmount.toFixed(2)),
+    baseRentalPrice: Number(baseRentalPrice.toFixed(2)),
+    platformFee: Number(platformFee.toFixed(2)),
+    hostCommission: Number(hostCommission.toFixed(2)),
+    adminCommission: Number(adminCommission.toFixed(2)),
+    depositAmount: car.depositAmount || 0,
+  };
+};
+
+// [PREVIOUS CODE]
+// export const calculateExtendBookingAmount = async (
+//   from: Date,
+//   to: Date,
+//   car: any,
+// ): Promise<any> => {
+//   if (!from || !to) {
+//     throw new Error("Invalid date provided");
+//   }
+
+//   const fromTime = new Date(from);
+//   const toTime = new Date(to);
+
+//   if (isNaN(fromTime.getTime()) || isNaN(toTime.getTime())) {
+//     throw new Error("Invalid date format");
+//   }
+
+//   const diffMs = toTime.getTime() - fromTime.getTime();
+
+//   if (diffMs <= 0) {
+//     throw new Error("Extend time must be after current booking end");
+//   }
+
+//   const totalHours = diffMs / (1000 * 60 * 60);
+
+//   if (!Number.isInteger(totalHours)) {
+//     throw new Error("Extend must be full hour slots");
+//   }
+
+//   if (!car?.dailyPrice || isNaN(car.dailyPrice)) {
+//     throw new Error("Invalid car daily price");
+//   }
+
+//   const hourlyRate = car.dailyPrice / 24;
+//   const baseExtendPrice = hourlyRate * totalHours;
+
+//   // Get charges configuration
+//   const charges = await Charges.findOne();
+//   if (!charges) {
+//     throw new ApiError(404, "Charges configuration not found");
+//   }
+
+//   const normalize = (percent: number) =>
+//     percent > 1 ? percent / 100 : percent;
+
+//   const platformPercent = normalize(charges.platformFee);
+//   const hostPercent = normalize(charges.hostCommission);
+//   const adminPercent = normalize(charges.adminCommission);
+
+//   // Calculate fees for extend
+//   const platformFee = +(baseExtendPrice * platformPercent).toFixed(2);
+//   const hostCommission = +(baseExtendPrice * hostPercent).toFixed(2);
+//   const adminCommission = +(
+//     baseExtendPrice -
+//     platformFee -
+//     hostCommission
+//   ).toFixed(2);
+
+//   const totalAmount = baseExtendPrice + platformFee;
+
+//   return {
+//     totalAmount: Number(totalAmount.toFixed(2)),
+//     baseExtendPrice: Number(baseExtendPrice.toFixed(2)),
+//     platformFee: Number(platformFee.toFixed(2)),
+//     hostCommission: Number(hostCommission.toFixed(2)),
+//     adminCommission: Number(adminCommission.toFixed(2)),
+//     extendedHours: totalHours,
+//   };
+// };
+
+const round = (value: number) => Number(value.toFixed(2));
+
+// [NEW CODE]
+export const calculateExtendBookingAmount = async (
+  from: Date,
+  to: Date,
+  car: any,
+  charges: any, // ✅ moved outside (IMPORTANT)
+): Promise<any> => {
+  if (!from || !to) {
+    throw new Error("Invalid date provided");
+  }
+
+  const fromTime = new Date(from);
+  const toTime = new Date(to);
+
+  if (isNaN(fromTime.getTime()) || isNaN(toTime.getTime())) {
+    throw new Error("Invalid date format");
+  }
+
+  const diffMs = toTime.getTime() - fromTime.getTime();
+
+  if (diffMs <= 0) {
+    throw new Error("Extend time must be after current booking end");
+  }
+
+  // ⛔ FIX: floating issue safe conversion
+  const totalHours = Math.round(diffMs / (1000 * 60 * 60));
+
+  if (totalHours <= 0) {
+    throw new Error("Extend must be valid hour slots");
+  }
+
+  if (!car?.dailyPrice || isNaN(car.dailyPrice)) {
+    throw new Error("Invalid car daily price");
+  }
+
+  // 💰 hourly calculation
+  const hourlyRate = car.dailyPrice / 24;
+  const baseExtendPrice = round(hourlyRate * totalHours);
+
+  if (!charges) {
+    throw new ApiError(404, "Charges configuration not found");
+  }
+
+  // normalize percent
+  const normalize = (percent: number) =>
+    percent > 1 ? percent / 100 : percent;
+
+  const platformPercent = normalize(charges.platformFee);
+  const hostPercent = normalize(charges.hostCommission);
+  const adminPercent = normalize(charges.adminCommission);
+
+  // 💸 fees calculation
+  const platformFee = round(baseExtendPrice * platformPercent);
+  const hostCommission = round(baseExtendPrice * hostPercent);
+
+  // 👉 consistent admin calculation (safe)
+  const adminCommission = round(
+    baseExtendPrice - platformFee - hostCommission,
+  );
+
+  // 💵 final amount
+  const totalAmount = round(baseExtendPrice + platformFee);
+
+  return {
+    totalAmount,
+    baseExtendPrice,
+    platformFee,
+    hostCommission,
+    adminCommission,
+    extendedHours: totalHours,
+  };
+};
+
+export const validateAvailabilityStrictForApproval = async (
+  carId: string,
+  from: Date,
+  to: Date,
+  ignoreBookingId: string,
+) => {
+  if (from >= to) {
+    throw new ApiError(400, "Invalid booking time range");
+  }
+
+  const car = await Car.findById(carId).select(
+    "isActive availableDays availableHours defaultStartTime defaultEndTime blockedDates",
+  );
+
+  if (!car) throw new ApiError(404, "Car not found");
+  if (!car.isActive) throw new ApiError(400, "Car is not active");
+
+  const requestedSlots = generateRequestedHours(from, to);
+
+  const dateMap = requestedSlots.reduce(
+    (map: Record<string, number[]>, slot) => {
+      if (!map[slot.date]) map[slot.date] = [];
+      map[slot.date].push(slot.hour);
+      return map;
+    },
+    {},
+  );
+
+  for (const [date, hours] of Object.entries(dateMap)) {
+    //  blocked date
+    const blocked = car.blockedDates?.find(
+      (b: any) => new Date(b.date).toISOString().split("T")[0] === date,
+    );
+    if (blocked) {
+      throw new ApiError(400, `Car blocked on ${date}`);
+    }
+
+    // available day
+    const dayName = new Date(date)
+      .toLocaleDateString("en-US", { weekday: "long" })
+      .toUpperCase() as AVAILABLE_DAYS;
+
+    if (car.availableDays?.length && !car.availableDays.includes(dayName)) {
+      throw new ApiError(400, `Car not available on ${date}`);
+    }
+
+    //  open hours
+    const openHours = new Set<number>();
+    if (car.availableHours?.length) {
+      car.availableHours.forEach((t) =>
+        openHours.add(parseInt(t.split(":")[0])),
+      );
+    } else if (car.defaultStartTime && car.defaultEndTime) {
+      const s = parseInt(car.defaultStartTime);
+      const e = parseInt(car.defaultEndTime);
+      for (let h = s; h < e; h++) openHours.add(h);
+    } else {
+      for (let h = 0; h < 24; h++) openHours.add(h);
+    }
+
+    //  conflict bookings (excluding current)
+    const bookings = await Booking.find({
+      carId,
+      _id: { $ne: ignoreBookingId },
+      bookingStatus: {
+        $in: [BOOKING_STATUS.CONFIRMED, BOOKING_STATUS.ONGOING],
+      },
+      fromDate: { $lt: to },
+      toDate: { $gt: from },
+    }).select("fromDate toDate");
+
+    const bookedHours = new Set<number>();
+    bookings.forEach((b) => {
+      const cursor = new Date(b.fromDate);
+      while (cursor < b.toDate) {
+        const local = getLocalDetails(cursor);
+        if (local.dateStr === date) bookedHours.add(local.hour);
+        cursor.setTime(cursor.getTime() + 3600000);
+      }
+    });
+
+    for (const hour of hours) {
+      if (!openHours.has(hour)) {
+        throw new ApiError(400, `Outside operating hours`);
+      }
+      if (bookedHours.has(hour)) {
+        throw new ApiError(400, `Time already booked`);
+      }
+    }
+  }
+
+  return true;
+};
+
+export const populateBookingConflictFields = async (booking: any) => {
+  const isExpired = booking.bookingStatus === BOOKING_STATUS.EXPIRED;
+
+  let isOverlapping = false;
+  let isCarAlreadyBooked = false;
+
+  if (
+    [BOOKING_STATUS.REQUESTED, BOOKING_STATUS.PENDING].includes(
+      booking.bookingStatus,
+    )
+  ) {
+    //  Check if the USER has an overlapping booking elsewhere
+    const overlapping = await Booking.findOne({
+      userId: booking.userId?._id || booking.userId,
+      _id: { $ne: booking._id },
+      bookingStatus: {
+        $in: [BOOKING_STATUS.CONFIRMED, BOOKING_STATUS.ONGOING],
+      },
+      fromDate: { $lt: booking.toDate },
+      toDate: { $gt: booking.fromDate },
+    });
+    isOverlapping = !!overlapping;
+
+    // Check if the CAR is already booked by SOMEONE ELSE for this slot
+    const carConflict = await Booking.findOne({
+      carId: booking.carId?._id || booking.carId,
+      _id: { $ne: booking._id },
+      bookingStatus: {
+        $in: [BOOKING_STATUS.CONFIRMED, BOOKING_STATUS.ONGOING],
+      },
+      fromDate: { $lt: booking.toDate },
+      toDate: { $gt: booking.fromDate },
+    });
+    isCarAlreadyBooked = !!carConflict;
+  }
+
+  return {
+    ...booking,
+    isExpired,
+    isOverlapping,
+    isCarAlreadyBooked,
+    isPayable:
+      booking.bookingStatus === BOOKING_STATUS.PENDING &&
+      !isExpired &&
+      !isOverlapping &&
+      !isCarAlreadyBooked,
+  };
+};
